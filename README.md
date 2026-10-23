@@ -1,5 +1,16 @@
 # TradingView Advanced Charts
 
+## Run the LSE-backed chart
+
+Start the local server with Node.js 22.4 or newer:
+
+```sh
+export LSE_API_KEY="lse_live_your_key"
+node server.mjs
+```
+
+Open `http://localhost:8000`. The chart opens on NQ 5-minute bars and searches/browses London Strategic Edge stocks, forex, futures, commodities, indices, crypto, and ETFs. With `LSE_API_KEY`, it enables 1-second through monthly candles and streams live ticks over the provider WebSocket. Without the key, it polls the public latest-tick endpoint every five seconds; NQ's higher intervals are aggregated from its minute bars. Keep the live API key in the server environment, never in browser code.
+
 [Demo][demo-url] | [Documentation][doc-url] | [Tutorial][tutorial-url] | [Discord community][discord-url]
 
 This repository contains the TradingView Advanced Charts package. If you use Git in your project, please feel free to use this repository as a submodule in yours.

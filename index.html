@@ -8,8 +8,6 @@
 		<meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,minimum-scale=1.0">
 
 		<script type="text/javascript" src="charting_library/charting_library.standalone.js"></script>
-		<script type="text/javascript" src="datafeeds/udf/dist/bundle.js"></script>
-
 		<script type="text/javascript">
 
 			function getParameterByName(name) {
@@ -19,30 +17,250 @@
 				return results === null ? "" : decodeURIComponent(results[1].replace(/\+/g, " "));
 			}
 
-			function initOnReady() {
-				var datafeedUrl = "https://demo-feed-data.tradingview.com";
-				var customDataUrl = getParameterByName('dataUrl');
-				if (customDataUrl !== "") {
-					datafeedUrl = customDataUrl.startsWith('https://') ? customDataUrl : `https://${customDataUrl}`;
+			var latestBars = new Map();
+			var latestTickTimes = new Map();
+			var subscriptions = new Map();
+
+			async function fetchBars(symbolInfo, resolution, from, to, latest) {
+				var url = new URL('/api/history', window.location.origin);
+				url.searchParams.set('symbol', symbolInfo.provider_symbol || symbolInfo.ticker);
+				url.searchParams.set('table', symbolInfo.data_table);
+				url.searchParams.set('category', symbolInfo.data_category);
+				url.searchParams.set('resolution', resolution);
+				if (latest) {
+					url.searchParams.set('latest', '1');
+				} else {
+					url.searchParams.set('from', String(from));
+					url.searchParams.set('to', String(to));
 				}
+				var response = await fetch(url);
+				if (!response.ok) throw new Error('Market data request failed: ' + response.status);
+				var rows = await response.json();
+				return rows.map(function (row) {
+					return {
+						time: Date.parse(row.timestamp || row.ts),
+						open: Number(row.open),
+						high: Number(row.high),
+						low: Number(row.low),
+						close: Number(row.close),
+						volume: Number(row.volume || 0),
+					};
+				}).sort(function (left, right) { return left.time - right.time; });
+			}
+
+			var basicResolutions = ['1', '5', '15', '60', '240', '1D'];
+			var vaultResolutions = ['1S', '5S', '15S', '30S', '1', '3', '5', '15', '30', '60', '240', '1D', '1W', '1M'];
+			var supportedResolutions = basicResolutions;
+			var realtimeEnabled = false;
+
+			var LseDatafeed = {
+				onReady: function (callback) {
+					fetch('/api/status').then(function (response) {
+						if (!response.ok) throw new Error('Unable to read datafeed status');
+						return response.json();
+					}).then(function (status) {
+						realtimeEnabled = status.realtimeEnabled;
+						supportedResolutions = status.vaultEnabled ? vaultResolutions : basicResolutions;
+					}).catch(function (error) {
+						console.error(error);
+					}).finally(function () {
+						callback({
+							supported_resolutions: supportedResolutions,
+							supports_marks: false,
+							supports_timescale_marks: false,
+							supports_time: false,
+							symbols_types: [
+								{ name: 'All', value: '' },
+								{ name: 'Stocks', value: 'stock' },
+								{ name: 'Forex', value: 'forex' },
+								{ name: 'Futures', value: 'futures' },
+								{ name: 'Commodities', value: 'commodity' },
+								{ name: 'Indices', value: 'index' },
+								{ name: 'Crypto', value: 'crypto' },
+								{ name: 'ETFs', value: 'etf' },
+							],
+						});
+					});
+				},
+				searchSymbols: async function (userInput, exchange, symbolType, onResult) {
+					try {
+						var searchUrl = new URL('/api/symbols', window.location.origin);
+						if (userInput) searchUrl.searchParams.set('q', userInput);
+						if (symbolType) searchUrl.searchParams.set('category', symbolType);
+						var symbols = await fetch(searchUrl).then(function (response) {
+							if (!response.ok) throw new Error('Symbol search failed');
+							return response.json();
+						});
+						onResult(symbols.map(function (item) {
+							return {
+								symbol: item.symbol,
+								full_name: item.symbol,
+								description: item.display_name || item.symbol,
+								exchange: 'LSE',
+								ticker: item.symbol,
+								type: item.category || 'stock',
+							};
+						}));
+					} catch (error) {
+						console.error(error);
+						onResult([]);
+					}
+				},
+				resolveSymbol: async function (symbolName, onResolve, onError) {
+					try {
+						var matches = await fetch('/api/symbols?q=' + encodeURIComponent(symbolName)).then(function (response) {
+							if (!response.ok) throw new Error('Symbol lookup failed');
+							return response.json();
+						});
+						var item = matches.find(function (candidate) {
+							return candidate.symbol.toLowerCase() === symbolName.toLowerCase() || candidate.provider_symbol.toLowerCase() === symbolName.toLowerCase();
+						}) || matches[0];
+						if (!item) throw new Error('Symbol not found: ' + symbolName);
+						onResolve({
+							name: item.symbol,
+							ticker: item.symbol,
+							provider_symbol: item.provider_symbol,
+							data_table: item.candle_table,
+							data_category: item.category || 'stock',
+							description: item.display_name || item.symbol,
+							type: item.category || 'stock',
+							exchange: 'LSE',
+							timezone: 'Etc/UTC',
+							session: '24x7',
+							minmov: 1,
+							pricescale: item.category === 'forex'
+								? (item.symbol.endsWith('/JPY') ? 1000 : 100000)
+								: item.category === 'commodity' ? 100 : 100,
+							volume_precision: 0,
+							has_intraday: true,
+							has_seconds: realtimeEnabled,
+							has_weekly_and_monthly: true,
+							supported_resolutions: supportedResolutions,
+							data_status: realtimeEnabled ? 'streaming' : 'delayed_streaming',
+						});
+					} catch (error) {
+						onError(error.message);
+					}
+				},
+				getBars: async function (symbolInfo, resolution, periodParams, onResult, onError) {
+					try {
+						var bars = await fetchBars(symbolInfo, resolution, periodParams.from, periodParams.to, false);
+						if (bars.length) latestBars.set(symbolInfo.ticker + ':' + resolution, bars[bars.length - 1]);
+						onResult(bars, { noData: bars.length === 0 });
+					} catch (error) {
+						onError(error.message);
+					}
+				},
+				subscribeBars: function (symbolInfo, resolution, onTick, listenerGuid) {
+					var key = symbolInfo.ticker + ':' + resolution;
+					var active = true;
+					var timer = null;
+					var source = null;
+					var timeframeMs = {
+						'1S': 1000, '5S': 5000, '15S': 15000, '30S': 30000,
+						'1': 60000, '3': 180000, '5': 300000, '15': 900000,
+						'30': 1800000, '60': 3600000, '240': 14400000,
+					};
+
+					function deliverBar(tick) {
+						var tickTime = typeof tick.ts === 'number' ? tick.ts * 1000 : Date.parse(tick.ts || tick.timestamp);
+						var price = Number(tick.price);
+						if (!Number.isFinite(tickTime) || !Number.isFinite(price)) return;
+						if (tickTime <= (latestTickTimes.get(key) || 0)) return;
+						latestTickTimes.set(key, tickTime);
+						var date = new Date(tickTime);
+						var barTime;
+						if (resolution === '1D') {
+							barTime = Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate());
+						} else if (resolution === '1W') {
+							var day = (date.getUTCDay() + 6) % 7;
+							barTime = Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate() - day);
+						} else if (resolution === '1M') {
+							barTime = Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), 1);
+						} else {
+							var duration = timeframeMs[resolution];
+							if (!duration) return;
+							barTime = Math.floor(tickTime / duration) * duration;
+						}
+						var previous = latestBars.get(key);
+						if (previous && barTime < previous.time) return;
+						var bar = previous && barTime === previous.time
+							? {
+								time: barTime,
+								open: previous.open,
+								high: Math.max(previous.high, price),
+								low: Math.min(previous.low, price),
+								close: price,
+								volume: (previous.volume || 0) + Number(tick.volume || 0),
+							}
+							: { time: barTime, open: price, high: price, low: price, close: price, volume: Number(tick.volume || 0) };
+						latestBars.set(key, bar);
+						onTick(bar);
+					}
+
+					function startPolling() {
+						if (!active || timer) return;
+						var pollLatestTick = async function () {
+							if (!active) return;
+						try {
+							var tickUrl = new URL('/api/latest-tick', window.location.origin);
+							tickUrl.searchParams.set('symbol', symbolInfo.provider_symbol || symbolInfo.ticker);
+							var response = await fetch(tickUrl);
+							if (!response.ok) throw new Error('Latest tick request failed: ' + response.status);
+							var ticks = await response.json();
+							if (ticks.length) deliverBar(ticks[0]);
+						} catch (error) {
+							console.error(error);
+						}
+						};
+						pollLatestTick();
+						timer = setInterval(pollLatestTick, 5000);
+					}
+
+					if (realtimeEnabled) {
+						var streamUrl = new URL('/api/stream', window.location.origin);
+						streamUrl.searchParams.set('symbol', symbolInfo.provider_symbol || symbolInfo.ticker);
+						source = new EventSource(streamUrl);
+						source.onmessage = function (event) {
+							try { deliverBar(JSON.parse(event.data)); } catch (error) { console.error(error); }
+						};
+						source.addEventListener('provider_error', function (event) {
+							console.error('Live feed error:', event.data);
+							source.close();
+							startPolling();
+						});
+					} else {
+						startPolling();
+					}
+					subscriptions.set(listenerGuid, function () {
+						active = false;
+						clearInterval(timer);
+						if (source) source.close();
+					});
+				},
+				unsubscribeBars: function (listenerGuid) {
+					var unsubscribe = subscriptions.get(listenerGuid);
+					if (unsubscribe) unsubscribe();
+					subscriptions.delete(listenerGuid);
+				},
+			};
+
+			function initOnReady() {
 
 				var widget = window.tvWidget = new TradingView.widget({
 					// debug: true, // uncomment this line to see Library errors and warnings in the console
 					fullscreen: true,
-					symbol: 'AAPL',
-					interval: '1D',
+					symbol: 'NQ',
+					interval: '5',
 					container: "tv_chart_container",
 
 					//	BEWARE: no trailing slash is expected in feed URL
-					datafeed: new Datafeeds.UDFCompatibleDatafeed(datafeedUrl, undefined, {
-						maxResponseLength: 1000,
-						expectedOrder: 'latestFirst',
-					}),
+					datafeed: LseDatafeed,
 					library_path: "charting_library/",
 					locale: getParameterByName('lang') || "en",
 
 					disabled_features: ["use_localstorage_for_settings"],
-					enabled_features: ["study_templates"],
+					enabled_features: ["study_templates", "seconds_resolution"],
 					charts_storage_url: 'https://saveload.tradingview.com',
 					charts_storage_api_version: "1.1",
 					client_id: 'tradingview.com',
